@@ -633,6 +633,7 @@ class FluxTransformer2DModel(
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
+        self.image_rotary_emb = None
 
     def forward(
         self,
@@ -717,11 +718,13 @@ class FluxTransformer2DModel(
             img_ids = img_ids[0]
 
         ids = torch.cat((txt_ids, img_ids), dim=0)
-        if is_torch_npu_available():
-            freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-            image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
-        else:
-            image_rotary_emb = self.pos_embed(ids)
+        
+        if self.image_rotary_emb is None:
+            if is_torch_npu_available():
+                freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
+                self.image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
+            else:
+                self.image_rotary_emb = self.pos_embed(ids)
 
         if joint_attention_kwargs is not None and "ip_adapter_image_embeds" in joint_attention_kwargs:
             ip_adapter_image_embeds = joint_attention_kwargs.pop("ip_adapter_image_embeds")
