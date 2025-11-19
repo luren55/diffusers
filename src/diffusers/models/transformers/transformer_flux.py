@@ -17,6 +17,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+# 添加导入
+if is_torch_npu_available:
+    import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -360,7 +363,11 @@ class FluxSingleTransformerBlock(nn.Module):
 
         self.norm = AdaLayerNormZeroSingle(dim)
         self.proj_mlp = nn.Linear(dim, self.mlp_hidden_dim)
-        self.act_mlp = nn.GELU(approximate="tanh")
+        # 改为npu_fast_gelu
+        if is_torch_npu_available:
+            self.act_mlp = torch_npu.npu_fast_gelu
+        else:
+            self.act_mlp = nn.GELU(approximate="tanh")
         self.proj_out = nn.Linear(dim + self.mlp_hidden_dim, dim)
 
         self.attn = FluxAttention(
