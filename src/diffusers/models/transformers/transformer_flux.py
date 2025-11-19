@@ -15,10 +15,16 @@
 import inspect
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import os
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if torch.distributed.is_available():
+    import torch.distributed._functional_collectives as funcol
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FluxTransformer2DLoadersMixin, FromOriginalModelMixin, PeftAdapterMixin
@@ -38,6 +44,7 @@ from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 if is_torch_npu_available:
     import torch_npu
+    from mindiesd import attention_forward as mindie_sd_attn_forward
     from ..normalization import RMSNorm
     from ..normalization import AdaLayerNormContinuousNpu as AdaLayerNormContinuous
     from ..normalization import AdaLayerNormZeroNpu as AdaLayerNormZero
@@ -52,18 +59,22 @@ else:
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
-def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
+def _get_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None, cal_q=True):
+    
     query = attn.to_q(hidden_states)
     key = attn.to_k(hidden_states)
     value = attn.to_v(hidden_states)
 
     encoder_query = encoder_key = encoder_value = None
-    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+    if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None and cal_q:
         encoder_query = attn.add_q_proj(encoder_hidden_states)
         encoder_key = attn.add_k_proj(encoder_hidden_states)
         encoder_value = attn.add_v_proj(encoder_hidden_states)
 
-    return query, key, value, encoder_query, encoder_key, encoder_value
+    if cal_q:
+        return query, key, value, encoder_query, encoder_key, encoder_value
+    else:
+        return query, key, value
 
 
 def _get_fused_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
@@ -76,11 +87,39 @@ def _get_fused_projections(attn: "FluxAttention", hidden_states, encoder_hidden_
     return query, key, value, encoder_query, encoder_key, encoder_value
 
 
-def _get_qkv_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None):
-    if attn.fused_projections:
+def _get_qkv_projections(attn: "FluxAttention", hidden_states, encoder_hidden_states=None, cal_q=True):
+    if attn.fused_projections and cal_q:
         return _get_fused_projections(attn, hidden_states, encoder_hidden_states)
-    return _get_projections(attn, hidden_states, encoder_hidden_states)
+    return _get_projections(attn, hidden_states, encoder_hidden_states, cal_q)
 
+def _wait_tensor(tensor):
+    if isinstance(tensor, funcol.AsyncCollectiveTensor):
+        tensor = tensor.wait()
+    return tensor
+
+def _all_to_all_single(x: torch.Tensor, group) -> torch.Tensor:
+    shape = x.shape
+    x = x.flatten()
+    x = funcol.all_to_all_single(x, None, None, group)
+    x = x.reshape(shape)
+    x = _wait_tensor(x)
+    return x
+
+def ulysses_preforward(
+    x: torch.Tensor,
+    group,
+    world_size,
+    B, 
+    S_LOCAL, 
+    H, 
+    D, 
+    H_LOCAL
+):
+    x = x.reshape(B, S_LOCAL, world_size, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+    x = x.flatten()
+    x = funcol.all_to_all_single(x, None, None, group)
+    return x
+    
 
 class FluxAttnProcessor:
     _attention_backend = None
@@ -97,7 +136,16 @@ class FluxAttnProcessor:
         encoder_hidden_states: torch.Tensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        pre_query: Optional[torch.Tensor] = None, # 新增pre_query参数传入
+        pre_key: Optional[torch.Tensor] = None, # 新增pre_key参数传入
+        cal_q=True, # 新增cal_q参数传入
     ) -> torch.Tensor:
+        # 如果当前并行状态启用且为cp并行，则进入_context_parallel_forward方法
+        if hasattr(self._parallel_config, "context_parallel_config") and \
+            self._parallel_config.context_parallel_config is not None:
+            return self._context_parallel_forward(
+                attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb, pre_query, pre_key, cal_q
+            )
         query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
             attn, hidden_states, encoder_hidden_states
         )
@@ -146,6 +194,101 @@ class FluxAttnProcessor:
 
             return hidden_states, encoder_hidden_states
         else:
+            return hidden_states
+
+    # 添加CP并行forward方法
+    def _context_parallel_forward(
+        self,
+        attn: "FluxAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        pre_query: Optional[torch.Tensor] = None,
+        pre_key: Optional[torch.Tensor] = None,
+        cal_q=True
+    ) -> torch.Tensor:
+
+        ulysses_mesh = self._parallel_config.context_parallel_config._ulysses_mesh
+        world_size = self._parallel_config.context_parallel_config.ulysses_degree
+        group = ulysses_mesh.get_group()
+
+        value = attn.to_v(hidden_states)
+        value = value.unflatten(-1, (attn.heads, -1))
+        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+            encoder_value = attn.add_v_proj(encoder_hidden_states)
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+            value = torch.cat([encoder_value, value], dim=1)
+
+        B, S_KV_LOCAL, H, D = value.shape
+        H_LOCAL = H // world_size
+        value_all = ulysses_preforward(value, group, world_size, B, S_KV_LOCAL, H, D, H_LOCAL)
+
+        query = attn.to_q(hidden_states)
+        query = query.unflatten(-1, (attn.heads, -1))
+        query = attn.norm_q(query)
+        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+            encoder_query = attn.add_q_proj(encoder_hidden_states)
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_query = attn.norm_added_q(encoder_query)
+            query = torch.cat([encoder_query, query], dim=1)
+        if image_rotary_emb is not None:
+            query = apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+        _, S_Q_LOCAL, _, _ = query.shape
+        query_all = ulysses_preforward(query, group, world_size, B, S_Q_LOCAL, H, D, H_LOCAL)
+
+        key = attn.to_k(hidden_states)
+        key = key.unflatten(-1, (attn.heads, -1))
+        key = attn.norm_k(key)
+        if encoder_hidden_states is not None and attn.added_kv_proj_dim is not None:
+            encoder_key = attn.add_k_proj(encoder_hidden_states)
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_key = attn.norm_added_k(encoder_key)
+            key = torch.cat([encoder_key, key], dim=1)
+        if image_rotary_emb is not None:
+            key = apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+        key_all = ulysses_preforward(key, group, world_size, B, S_KV_LOCAL, H, D, H_LOCAL)
+
+        value_all = _wait_tensor(value_all)
+        value_all = value_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        query_all = _wait_tensor(query_all)
+        query_all = query_all.reshape(world_size, S_Q_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+
+        key_all = _wait_tensor(key_all)
+        key_all = key_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        out = mindie_sd_attn_forward(
+            query_all,
+            key_all,
+            value_all,
+            opt_mode="manual",
+            op_type="ascend_laser_attention",
+            layout="BNSD"
+        )
+
+        out = out.reshape(B, H_LOCAL, world_size, S_Q_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+
+        if encoder_hidden_states is not None:
+            out = _all_to_all_single(out, group)
+            hidden_states = out.flatten(0, 1).permute(1, 2, 0, 3).contiguous()
+
+            hidden_states = hidden_states.flatten(2, 3)
+            hidden_states = hidden_states.to(query.dtype)
+            
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            hidden_states = attn.to_out[0](hidden_states)
+            hidden_states = attn.to_out[1](hidden_states)
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+            return hidden_states, encoder_hidden_states
+        else:
+            out = out.flatten()
+            out = funcol.all_to_all_single(out, None, None, group)
+            hidden_states = out.reshape(world_size, H_LOCAL, B, S_Q_LOCAL, D).flatten(0, 1).permute(1, 2, 0, 3)
             return hidden_states
 
 
@@ -401,13 +544,20 @@ class FluxSingleTransformerBlock(nn.Module):
 
         residual = hidden_states
         norm_hidden_states, gate = self.norm(hidden_states, emb=temb)
-        mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states))
+        # mlp_hidden_states = self.act_mlp(self.proj_mlp(norm_hidden_states)) # 注释该行
         joint_attention_kwargs = joint_attention_kwargs or {}
         attn_output = self.attn(
             hidden_states=norm_hidden_states,
             image_rotary_emb=image_rotary_emb,
             **joint_attention_kwargs,
         )
+        # 新增以下代码
+        mlp_hidden_states = self.proj_mlp(norm_hidden_states)
+        attn_output = _wait_tensor(attn_output)
+        attn_output = attn_output.contiguous()
+        if attn_output.ndim == 4:
+            attn_output = attn_output.flatten(2, 3)
+        mlp_hidden_states = self.act_mlp(mlp_hidden_states)
 
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=2)
         gate = gate.unsqueeze(1)
