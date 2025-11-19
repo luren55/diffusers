@@ -82,6 +82,8 @@ class GELU(nn.Module):
         if gate.device.type == "mps" and is_torch_version("<", "2.0.0"):
             # fp16 gelu not supported on mps before torch 2.0
             return F.gelu(gate.to(dtype=torch.float32), approximate=self.approximate).to(dtype=gate.dtype)
+        elif gate.device.type == "npu":  # 添加fast_gelu方法
+            return torch_npu.npu_fast_gelu(gate)
         return F.gelu(gate, approximate=self.approximate)
 
     def forward(self, hidden_states):
