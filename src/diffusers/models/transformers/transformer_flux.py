@@ -39,7 +39,7 @@ from ..embeddings import (
 )
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
-from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
+from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle, RMSNorm
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -313,8 +313,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
         self.added_kv_proj_dim = added_kv_proj_dim
         self.added_proj_bias = added_proj_bias
 
-        self.norm_q = torch.nn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
-        self.norm_k = torch.nn.RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_q = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
+        self.norm_k = RMSNorm(dim_head, eps=eps, elementwise_affine=elementwise_affine)
         self.to_q = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
         self.to_k = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
         self.to_v = torch.nn.Linear(query_dim, self.inner_dim, bias=bias)
@@ -325,8 +325,8 @@ class FluxAttention(torch.nn.Module, AttentionModuleMixin):
             self.to_out.append(torch.nn.Dropout(dropout))
 
         if added_kv_proj_dim is not None:
-            self.norm_added_q = torch.nn.RMSNorm(dim_head, eps=eps)
-            self.norm_added_k = torch.nn.RMSNorm(dim_head, eps=eps)
+            self.norm_added_q = RMSNorm(dim_head, eps=eps)
+            self.norm_added_k = RMSNorm(dim_head, eps=eps)
             self.add_q_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
             self.add_k_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
             self.add_v_proj = torch.nn.Linear(added_kv_proj_dim, self.inner_dim, bias=added_proj_bias)
