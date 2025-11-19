@@ -25,6 +25,131 @@ from .activations import get_activation
 from .embeddings import CombinedTimestepLabelEmbeddings, PixArtAlphaCombinedTimestepSizeEmbeddings
 
 
+# 添加以下三个方法
+class AdaLayerNormZeroNpu(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True):
+        super().__init__()
+        
+        import ascend_ops._C
+        torch.ops.load_library(ascend_ops._C.__file__)
+        
+        if num_embeddings is not None:
+            self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
+
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        timestep: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        hidden_dtype: Optional[torch.dtype] = None,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = torch.ops.ascend_ops.adalayernorm(
+            x=x,
+            scale=scale_msa[:, None],
+            shift=shift_msa[:, None],
+            epsilson=1e-6)
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+class AdaLayerNormZeroSingleNpu(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
+        super().__init__()
+
+        import ascend_ops._C
+        torch.ops.load_library(ascend_ops._C.__file__)
+        
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(embedding_dim, 3 * embedding_dim, bias=bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = emb.chunk(3, dim=1)
+        x = torch.ops.ascend_ops.adalayernorm(
+            x=x,
+            scale= scale_msa[:, None],
+            shift=shift_msa[:, None],
+            epsilson=1e-6)
+        return x, gate_msa
+
+class AdaLayerNormContinuousNpu(nn.Module):
+    r"""
+    Adaptive normalization layer with a norm layer (layer_norm or rms_norm).
+
+    Args:
+        embedding_dim (`int`): Embedding dimension to use during projection.
+        conditioning_embedding_dim (`int`): Dimension of the input condition.
+        elementwise_affine (`bool`, defaults to `True`):
+            Boolean flag to denote if affine transformation should be applied.
+        eps (`float`, defaults to 1e-5): Epsilon factor.
+        bias (`bias`, defaults to `True`): Boolean flag to denote if bias should be use.
+        norm_type (`str`, defaults to `"layer_norm"`):
+            Normalization layer to use. Values supported: "layer_norm", "rms_norm".
+    """
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        conditioning_embedding_dim: int,
+        # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
+        # because the output is immediately scaled and shifted by the projected conditioning embeddings.
+        # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
+        # However, this is how it was implemented in the original code, and it's rather likely you should
+        # set `elementwise_affine` to False.
+        elementwise_affine=True,
+        eps=1e-5,
+        bias=True,
+        norm_type="layer_norm",
+    ):
+        super().__init__()
+        
+        import ascend_ops._C
+        torch.ops.load_library(ascend_ops._C.__file__)
+        
+        self.eps = eps
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
+
+    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
+        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
+        scale, shift = torch.chunk(emb, 2, dim=1)
+        x = torch.ops.ascend_ops.adalayernorm(
+            x=x,
+            scale= scale[:, None, :],
+            shift=shift[:, None, :],
+            epsilson=self.eps)
+        return x
+
+
 class AdaLayerNorm(nn.Module):
     r"""
     Norm layer modified to incorporate timestep embeddings.
