@@ -17,9 +17,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-# 添加导入
-if is_torch_npu_available:
-    import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -39,7 +36,17 @@ from ..embeddings import (
 )
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
-from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle, RMSNorm
+if is_torch_npu_available:
+    import torch_npu
+    from ..normalization import RMSNorm
+    from ..normalization import AdaLayerNormContinuousNpu as AdaLayerNormContinuous
+    from ..normalization import AdaLayerNormZeroNpu as AdaLayerNormZero
+    from ..normalization import AdaLayerNormZeroSingleNpu as AdaLayerNormZeroSingle
+    # 添加算子包导入
+    import ascend_ops._C
+    torch.ops.load_library(ascend_ops._C.__file__)
+else:
+    from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle, RMSNorm
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -473,8 +480,15 @@ class FluxTransformerBlock(nn.Module):
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+        if is_torch_npu_available:
+            norm_hidden_states = torch.ops.ascend_ops.adalayernorm(
+                x=hidden_states, 
+                scale=scale_mlp[:, None], 
+                shift=shift_mlp[:, None], 
+                epsilson=1e-6)
+        else:
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
 
         ff_output = self.ff(norm_hidden_states)
         ff_output = gate_mlp.unsqueeze(1) * ff_output
@@ -487,8 +501,15 @@ class FluxTransformerBlock(nn.Module):
         context_attn_output = c_gate_msa.unsqueeze(1) * context_attn_output
         encoder_hidden_states = encoder_hidden_states + context_attn_output
 
-        norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
-        norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+        if is_torch_npu_available:
+            norm_encoder_hidden_states = torch.ops.ascend_ops.adalayernorm(
+                x=encoder_hidden_states, 
+                scale=c_scale_mlp[:, None], 
+                shift=c_shift_mlp[:, None], 
+                epsilson=1e-6)
+        else:
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
 
         context_ff_output = self.ff_context(norm_encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
